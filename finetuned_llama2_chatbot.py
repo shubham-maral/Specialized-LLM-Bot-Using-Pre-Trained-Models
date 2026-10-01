@@ -1,62 +1,100 @@
+import os
+
 import streamlit as st
-import requests
-import json
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Set page configuration
-st.set_page_config(page_title="💬 Finance Chatbot")
 
-# Sidebar content
+MODEL_NAME = os.getenv("LOCAL_MODEL_NAME", "HuggingFaceTB/SmolLM2-360M-Instruct")
+MODEL_CACHE = os.getenv("LOCAL_MODEL_CACHE", "E:/hf_cache")
+SYSTEM_PROMPT = """You are a careful finance education assistant.
+Explain financial terms in simple language and use short examples when useful.
+Do not invent current prices, laws, or market facts. If current data is required,
+say that you do not have live market data. Do not give personalized investment,
+tax, or legal advice. State uncertainty clearly."""
+
+st.set_page_config(page_title="Finance LLM Chatbot", page_icon="💬")
+st.title("💬 Finance LLM Chatbot")
+st.caption("Self-contained local demonstration • educational answers only")
+
+
+@st.cache_resource(show_spinner="Loading the local language model for the first time...")
+def load_model():
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, cache_dir=MODEL_CACHE)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        dtype=torch.float32,
+        low_cpu_mem_usage=True,
+        cache_dir=MODEL_CACHE,
+    )
+    model.eval()
+    return model, tokenizer
+
+
+def generate_response(question, history):
+    model, tokenizer = load_model()
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for message in history[-4:]:
+        messages.append({"role": message["role"], "content": message["content"]})
+    messages.append({"role": "user", "content": question})
+
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer(prompt, return_tensors="pt")
+    with torch.inference_mode():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=180,
+            do_sample=False,
+            repetition_penalty=1.12,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    new_tokens = output[0, inputs["input_ids"].shape[1] :]
+    return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+
+
 with st.sidebar:
-    st.title('💬 Finance Chatbot')
-    st.write('This chatbot uses a fine-tuned Llama-2-7b model for finance-related queries.')
-    ngrok_url = st.text_input('Enter ngrok URL:', value="http://localhost:5000")
+    st.subheader("Demo information")
+    st.write(f"Local deployment model: `{MODEL_NAME}`")
+    st.info(
+        "The Colab notebook records the separate Llama-2 QLoRA experiment. "
+        "This smaller model is used for a reliable CPU-only live demonstration."
+    )
+    if st.button("Clear conversation"):
+        st.session_state.messages = []
+        st.rerun()
 
-if not ngrok_url:
-    st.warning('Please enter the ngrok URL!', icon='⚠️')
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-# Function to generate response
-def generate_response(prompt_input):
-    headers = {"Content-Type": "application/json"}
-    payload = {"prompt": prompt_input}
-    response = requests.post(f"{ngrok_url}/generate", headers=headers, data=json.dumps(payload))
-    try:
-        response_json = response.json()
-        return response_json['generated_text']
-    except json.JSONDecodeError:
-        st.error("Error decoding JSON response")
-        st.write("Response text:", response.text)
-        return None
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error making request: {str(e)}")
-        return None
+if not st.session_state.messages:
+    st.chat_message("assistant").write(
+        "Hello! Ask me to explain a finance concept, ratio, or general scenario."
+    )
 
-# Initialize chat messages
-if "messages" not in st.session_state.keys():
-    st.session_state.messages = [{"role": "assistant", "content": "How may I assist you today?"}]
-
-# Display chat messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.write(message["content"])
 
-# Clear chat history function
-def clear_chat_history():
-    st.session_state.messages = [{"role": "assistant", "content": "How may I assist you today?"}]
-
-# Sidebar button to clear chat history
-st.sidebar.button('Clear Chat History', on_click=clear_chat_history)
-
-# Input field for the prompt
-if prompt := st.chat_input("Enter your message:", disabled=not ngrok_url):
-    st.session_state.messages.append({"role": "user", "content": prompt})
+if question := st.chat_input("Ask a finance question"):
+    previous_messages = list(st.session_state.messages)
+    st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
-        st.write(prompt)
+        st.write(question)
 
-# Generate response if the last message is from the user
-if st.session_state.messages[-1]["role"] != "assistant":
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            response = generate_response(prompt)
-            if response:
-                st.write(response)
-                st.session_state.messages.append({"role": "assistant", "content": response})
+        try:
+            with st.spinner("Generating locally on CPU..."):
+                answer = generate_response(question, previous_messages)
+        except Exception as exc:
+            st.error(
+                "The local model could not start. Check the internet connection on "
+                "the first run and install requirements-local.txt."
+            )
+            st.exception(exc)
+        else:
+            st.write(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+
+st.caption("This prototype provides educational information, not financial advice.")
